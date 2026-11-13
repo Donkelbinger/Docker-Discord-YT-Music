@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 import asyncio
+import logging
+import shutil
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -19,20 +21,32 @@ if not discord.opus.is_loaded():
         print("WARNING: Could not find opus library")
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -af "loudnorm=I=-16:TP=-1.5:LRA=11,volume=0.5"'
 }
 
 YDL_OPTIONS = {
-    'format': 'bestaudio/best',
+    'format': 'bestaudio[protocol^=https]/bestaudio/best',
     'noplaylist': True,
     'quiet': False,
     'no_warnings': False,
     'extract_flat': False,
-    'extractor_args': {'youtube': {'player_client': ['android']}},
     'socket_timeout': 30,
     'retries': 3,
+    'remote_components': ['ejs:github'],
 }
+
+if os.path.isfile('cookies.txt'):
+    shutil.copyfile('cookies.txt', 'cookies-yt.txt')
+    YDL_OPTIONS['cookiefile'] = 'cookies-yt.txt'
+
+
+def ffmpeg_options(headers: dict) -> dict:
+    """Build ffmpeg options, passing the headers yt-dlp wants for the stream URL."""
+    before = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+    if headers:
+        header_lines = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+        before += f' -headers "{header_lines}"'
+    return {'before_options': before, **FFMPEG_OPTIONS}
 
 
 @dataclass
@@ -46,7 +60,8 @@ class Song:
     def duration_str(self) -> str:
         if not self.duration:
             return "Unknown"
-        mins, secs = divmod(self.duration, 60)
+        total_secs = int(self.duration)
+        mins, secs = divmod(total_secs, 60)
         hours, mins = divmod(mins, 60)
         if hours:
             return f"{hours}:{mins:02d}:{secs:02d}"
@@ -160,17 +175,19 @@ async def search_youtube(query: str) -> Optional[dict]:
         return None
 
 
-async def get_stream_url(video_url: str) -> Optional[str]:
-    """Get fresh stream URL for a video (URLs expire)."""
+async def get_stream_info(video_url: str) -> Optional[tuple[str, dict]]:
+    """Get fresh stream URL and required HTTP headers for a video (URLs expire)."""
     ydl_opts = YDL_OPTIONS.copy()
     try:
         loop = asyncio.get_running_loop()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(video_url, download=False))
-            return info.get('url') if info else None
+            if info and info.get('url'):
+                print(f"Stream format: {info.get('format_id')} ({info.get('ext')}, {info.get('protocol')})")
+                return info['url'], info.get('http_headers') or {}
     except Exception as e:
         print(f"Error getting stream URL: {e}")
-        return None
+    return None
 
 
 async def play_next(interaction: discord.Interaction):
@@ -187,19 +204,26 @@ async def play_next(interaction: discord.Interaction):
 
     song = queue.next()
     if not song:
+        if guild.id in bot.now_playing_messages:
+            try:
+                await bot.now_playing_messages[guild.id].delete()
+            except:
+                pass
+            del bot.now_playing_messages[guild.id]
         await start_idle_timer(guild.id)
         return
     
     cancel_idle_timer(guild.id)
 
-    stream_url = await get_stream_url(song.url)
-    if not stream_url:
+    stream = await get_stream_info(song.url)
+    if not stream:
         print(f"Failed to get stream URL for: {song.title}")
         await play_next(interaction)
         return
+    stream_url, headers = stream
 
     try:
-        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+        source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options(headers))
         
         def after_playing(error):
             if error:
@@ -457,4 +481,4 @@ if __name__ == "__main__":
     if not token:
         print("Error: DISCORD_TOKEN environment variable not set")
         exit(1)
-    bot.run(token)
+    bot.run(token, log_level=logging.DEBUG)
