@@ -1,6 +1,6 @@
 'use strict';
 
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -165,41 +165,22 @@ async function searchYoutube(query) {
   };
 }
 
-async function getStreamInfo(videoUrl) {
-  const out = await ytdlp(['-j', '--no-playlist', ...FORMAT_ARGS, ...cookieArgs, videoUrl]);
-  const info = JSON.parse(out);
-
-  if (info?.url) {
-    console.log(`Stream format: ${info.format_id} (${info.ext}, ${info.protocol})`);
-    return { url: info.url, headers: info.http_headers || {} };
-  }
-
-  // Fallback: pick an audio-capable format manually.
-  const fmts = (info?.formats || []).filter((f) => f.url && f.acodec !== 'none');
-  const pick = fmts.filter((f) => !f.vcodec || f.vcodec === 'none').at(-1) ?? fmts.at(-1);
-  if (!pick) return null;
-  console.log(`Stream format: ${pick.format_id} (${pick.ext}, ${pick.protocol})`);
-  return { url: pick.url, headers: pick.http_headers || info?.http_headers || {} };
-}
-
 // ---------------------------------------------------------------------------
-// ffmpeg -> Ogg Opus
+// yt-dlp (download) -> ffmpeg (encode) -> Ogg Opus
 // ---------------------------------------------------------------------------
 
-function spawnFfmpeg(stream) {
-  const headers =
-    stream.headers && Object.keys(stream.headers).length
-      ? Object.entries(stream.headers)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join('\r\n') + '\r\n'
-      : null;
+// yt-dlp downloads the stream itself (chunked, with the right headers/cookies);
+// handing the raw googlevideo URL to ffmpeg gets 403 Forbidden.
+function spawnPipeline(videoUrl, guildId) {
+  const dl = spawn(
+    YT_DLP,
+    ['--no-playlist', '--quiet', '--no-warnings', ...FORMAT_ARGS, ...cookieArgs, '-o', '-', videoUrl],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  dl.stderr.on('data', (d) => console.error(`[${guildId}] yt-dlp: ${d.toString().trim()}`));
 
   const args = [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    ...(headers ? ['-headers', headers] : []),
-    '-i', stream.url,
+    '-i', 'pipe:0',
     '-vn',
     '-af', `loudnorm=I=-16:TP=-1.5:LRA=11,volume=${DEFAULT_VOLUME}`,
     '-c:a', 'libopus',
@@ -211,7 +192,13 @@ function spawnFfmpeg(stream) {
     'pipe:1',
   ];
 
-  return spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'inherit'] });
+  const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'inherit'] });
+  dl.stdout.pipe(ffmpeg.stdin);
+  // Broken pipe when ffmpeg is killed (skip/leave) is expected.
+  ffmpeg.stdin.on('error', () => {});
+  dl.stdout.on('error', () => {});
+  ffmpeg.on('close', () => dl.kill('SIGKILL'));
+  return ffmpeg;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,18 +219,7 @@ async function playNext(guildId) {
   }
   cancelIdleTimer(state);
 
-  let stream;
-  try {
-    stream = await getStreamInfo(song.url);
-  } catch (err) {
-    console.error(`[${guildId}] stream extraction failed for ${song.url}:`, err.message);
-  }
-  if (!stream) {
-    console.error(`[${guildId}] skipping "${song.title}" - no stream URL`);
-    return playNext(guildId);
-  }
-
-  const ffmpeg = spawnFfmpeg(stream);
+  const ffmpeg = spawnPipeline(song.url, guildId);
   state.ffmpeg = ffmpeg;
   const resource = createAudioResource(ffmpeg.stdout, {
     inputType: StreamType.OggOpus,
@@ -367,7 +343,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!voiceChannel) {
         return interaction.reply({
           content: 'You need to be in a voice channel!',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -417,7 +393,7 @@ client.on('interactionCreate', async (interaction) => {
     case 'skip': {
       const state = guildStates.get(guildId);
       if (!state || state.player.state.status !== AudioPlayerStatus.Playing) {
-        return interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is playing right now.', flags: MessageFlags.Ephemeral });
       }
       const skipped = state.current;
       state.player.stop();
@@ -433,7 +409,7 @@ client.on('interactionCreate', async (interaction) => {
     case 'queue': {
       const state = guildStates.get(guildId);
       if (!state?.current && !state?.queue.length) {
-        return interaction.reply({ content: 'The queue is empty.', ephemeral: true });
+        return interaction.reply({ content: 'The queue is empty.', flags: MessageFlags.Ephemeral });
       }
 
       const embed = new EmbedBuilder().setTitle('🎵 Music Queue').setColor(COLORS.purple);
@@ -478,7 +454,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!state || number < 1 || number > state.queue.length) {
         return interaction.reply({
           content: `Invalid queue number. Please use a number between 1 and ${state?.queue.length ?? 0}.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -494,7 +470,7 @@ client.on('interactionCreate', async (interaction) => {
     case 'leave': {
       const state = guildStates.get(guildId);
       if (!state?.connection) {
-        return interaction.reply({ content: "I'm not in a voice channel.", ephemeral: true });
+        return interaction.reply({ content: "I'm not in a voice channel.", flags: MessageFlags.Ephemeral });
       }
 
       await cleanupGuild(guildId);
